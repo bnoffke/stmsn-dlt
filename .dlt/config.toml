@@ -1,0 +1,17 @@
+# dlt Configuration File
+# Non-sensitive configuration settings (safe to commit)
+
+# Filesystem destination settings for GeoParquet output
+[destination.filesystem]
+# Layout for parquet files - using hive partitioning by year
+layout = "{table_name}/year={year}/{file_id}.{ext}"
+
+# Data writer settings
+[destination.filesystem.data_writer]
+file_format = "parquet"
+
+# Parquet compression and performance settings
+[destination.filesystem.data_writer.parquet]
+compression = "snappy"
+row_group_size = 100000
+data_page_size = 1048576

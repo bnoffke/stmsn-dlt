@@ -1,0 +1,13 @@
+# ArcGIS Dataset Configuration
+# Add new datasets here - no code changes required
+
+arcgis_datasets:
+  - name: parcels
+    layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA2/FeatureServer/0/query"
+    geometry_type: polygon
+    description: "Madison parcel boundaries and property information"
+
+  - name: streets
+    layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA_ENGR/MapServer/1/query"
+    geometry_type: linestring
+    description: "Madison street centerlines"
