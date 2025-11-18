@@ -6,11 +6,116 @@ with built-in pagination, retry logic, and rate limiting.
 """
 
 import time
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Optional, List
 from urllib.parse import urlencode
+from dataclasses import dataclass, field
 
 import requests
 from shapely.geometry import shape, Polygon, LineString, MultiLineString, Point
+
+
+@dataclass
+class MetricConfig:
+    """Configuration for a validation metric."""
+    name: str
+    aggregate: str  # 'sum', 'avg', 'min', 'max', 'count'
+    api_field: str  # Field name in ArcGIS API JSON response
+    tolerance_percent: Optional[float] = None
+
+
+@dataclass
+class MetricsAccumulator:
+    """
+    Accumulates metrics while iterating through records.
+
+    This collects validation metrics in-flight during data fetch
+    to avoid making separate API calls for validation.
+    """
+    metric_configs: List[MetricConfig] = field(default_factory=list)
+    row_count: int = 0
+
+    # Accumulated values by metric name
+    _sums: Dict[str, float] = field(default_factory=dict)
+    _counts: Dict[str, int] = field(default_factory=dict)
+    _mins: Dict[str, float] = field(default_factory=dict)
+    _maxs: Dict[str, float] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """Initialize accumulator storage for each metric."""
+        for metric in self.metric_configs:
+            if metric.aggregate == 'sum':
+                self._sums[metric.name] = 0.0
+            elif metric.aggregate == 'avg':
+                self._sums[metric.name] = 0.0
+                self._counts[metric.name] = 0
+            elif metric.aggregate == 'min':
+                self._mins[metric.name] = float('inf')
+            elif metric.aggregate == 'max':
+                self._maxs[metric.name] = float('-inf')
+            elif metric.aggregate == 'count':
+                self._counts[metric.name] = 0
+
+    def add_record(self, record: Dict[str, Any]) -> None:
+        """
+        Process a single record and update metric accumulators.
+
+        Args:
+            record: Feature dictionary with properties
+        """
+        self.row_count += 1
+
+        for metric in self.metric_configs:
+            value = record.get(metric.api_field)
+
+            # Skip null/None values
+            if value is None:
+                continue
+
+            try:
+                # Convert to float for numeric operations
+                numeric_value = float(value)
+
+                if metric.aggregate == 'sum':
+                    self._sums[metric.name] += numeric_value
+                elif metric.aggregate == 'avg':
+                    self._sums[metric.name] += numeric_value
+                    self._counts[metric.name] += 1
+                elif metric.aggregate == 'min':
+                    self._mins[metric.name] = min(self._mins[metric.name], numeric_value)
+                elif metric.aggregate == 'max':
+                    self._maxs[metric.name] = max(self._maxs[metric.name], numeric_value)
+                elif metric.aggregate == 'count':
+                    self._counts[metric.name] += 1
+
+            except (ValueError, TypeError):
+                # Skip non-numeric values
+                pass
+
+    def get_results(self) -> Dict[str, Any]:
+        """
+        Get final computed metrics.
+
+        Returns:
+            Dictionary with metric names and their computed values
+        """
+        results = {'row_count': self.row_count}
+
+        for metric in self.metric_configs:
+            if metric.aggregate == 'sum':
+                results[metric.name] = self._sums[metric.name]
+            elif metric.aggregate == 'avg':
+                count = self._counts[metric.name]
+                results[metric.name] = self._sums[metric.name] / count if count > 0 else 0.0
+            elif metric.aggregate == 'min':
+                val = self._mins[metric.name]
+                results[metric.name] = val if val != float('inf') else None
+            elif metric.aggregate == 'max':
+                val = self._maxs[metric.name]
+                results[metric.name] = val if val != float('-inf') else None
+            elif metric.aggregate == 'count':
+                results[metric.name] = self._counts[metric.name]
+
+        return results
 
 
 class ArcGISClient:
@@ -92,7 +197,10 @@ class ArcGISClient:
             raise ValueError(f"Unsupported geometry type: {geom_type}")
 
     def fetch_features(
-        self, layer_name: str, max_records: Optional[int] = None
+        self,
+        layer_name: str,
+        max_records: Optional[int] = None,
+        metrics_accumulator: Optional[MetricsAccumulator] = None,
     ) -> Iterator[Dict[str, Any]]:
         """
         Fetch all features from an ArcGIS layer with automatic pagination.
@@ -100,6 +208,8 @@ class ArcGISClient:
         Args:
             layer_name: Name of the layer (for logging)
             max_records: Optional limit on total records to fetch (for testing)
+            metrics_accumulator: Optional MetricsAccumulator to collect validation metrics
+                               in-flight during data fetch
 
         Yields:
             Individual feature dictionaries with geometry (as WKB hex if convert_to_wkb=True)
@@ -199,6 +309,10 @@ class ArcGISClient:
                 else:
                     # Keep as original dict (for backward compatibility)
                     record["geometry"] = geom_data
+
+                # Accumulate metrics if configured
+                if metrics_accumulator is not None:
+                    metrics_accumulator.add_record(record)
 
                 yield record
                 total_fetched += 1

@@ -27,9 +27,37 @@ from typing import Any, Dict, Iterator, List, Optional
 import dlt
 import yaml
 
-from clients.arcgis import ArcGISClient
+from clients.arcgis import ArcGISClient, MetricsAccumulator, MetricConfig
 from clients.arcgis_metadata import ArcGISMetadataExtractor
 from utils.geoparquet_finalizer import GeoParquetFinalizer
+from utils.data_validator import DataValidator, ValidationError
+import json
+
+# Global variable to collect validation results across resources
+_validation_results = []
+
+
+def create_validation_resource():
+    """
+    Create a dlt resource for validation results tracking.
+
+    This resource stores validation history for all datasets,
+    allowing audit trail of data quality checks.
+
+    Returns:
+        dlt resource for validation results
+    """
+
+    @dlt.resource(
+        name="validation_results",
+        write_disposition="append",  # Keep historical records
+    )
+    def extract_validation_results() -> Iterator[Dict[str, Any]]:
+        """Yield collected validation results."""
+        for result in _validation_results:
+            yield result
+
+    return extract_validation_results
 
 
 def create_metadata_resource(datasets: List[Dict[str, Any]]):
@@ -81,22 +109,42 @@ def create_metadata_resource(datasets: List[Dict[str, Any]]):
 
 def create_arcgis_resource(
     dataset_config: Dict[str, Any],
+    jurisdiction: str,
     crs: Optional[int] = None,
-    max_records: Optional[int] = None
+    max_records: Optional[int] = None,
+    validator: Optional[DataValidator] = None,
+    skip_validation: bool = False,
+    current_year: Optional[int] = None,
 ):
     """
-    Create a dlt resource for an ArcGIS dataset.
+    Create a dlt resource for an ArcGIS dataset with optional validation.
 
     Args:
-        dataset_config: Dataset configuration from YAML (name, layer_url, etc.)
+        dataset_config: Dataset configuration from YAML (name, layer_url, validation config, etc.)
+        jurisdiction: Jurisdiction name for validation baseline queries
         crs: CRS EPSG code to request from ArcGIS (e.g., 8193 for Madison)
         max_records: Optional limit on records to fetch (for testing/sampling)
+        validator: Optional DataValidator instance for validation
+        skip_validation: If True, skip validation even if configured
+        current_year: Current year for filtering validation baseline data
 
     Returns:
         dlt resource configured for the dataset
+
+    Raises:
+        ValidationError: If validation is enabled and fails
     """
     name = dataset_config["name"]
     layer_url = dataset_config["layer_url"]
+    validation_config = dataset_config.get("validation", {})
+
+    # Check if validation is enabled for this dataset
+    validation_enabled = (
+        validation_config.get("enabled", True)  # Default to enabled if validation block exists
+        and validator is not None
+        and not skip_validation
+        and max_records is None  # Don't validate in sampling mode
+    )
 
     @dlt.resource(
         name=name,
@@ -104,13 +152,147 @@ def create_arcgis_resource(
         columns={"geometry": {"data_type": "text"}},  # Treat WKB hex as text
     )
     def extract_dataset() -> Iterator[Dict[str, Any]]:
-        """Extract data from ArcGIS REST API with WKB geometry."""
+        """Extract data from ArcGIS REST API with WKB geometry and optional validation."""
         client = ArcGISClient(base_url=layer_url, convert_to_wkb=True, output_crs=crs)
 
-        for record in client.fetch_features(layer_name=name, max_records=max_records):
-            # Year partition comes from Hive path layout, not data
-            # (layout in .dlt/config.toml: "{table_name}/year={YYYY}/{file_id}.{ext}")
-            yield record
+        # Setup metrics accumulator if validation is enabled
+        metrics_accumulator = None
+        metric_configs_list = []
+
+        if validation_enabled and validation_config.get("metrics"):
+            # Parse metric configurations from YAML
+            for metric_cfg in validation_config["metrics"]:
+                metric_configs_list.append(
+                    MetricConfig(
+                        name=metric_cfg["parquet_column"],
+                        aggregate=metric_cfg["aggregate"],
+                        api_field=metric_cfg["api_field"],
+                        tolerance_percent=metric_cfg.get("tolerance_percent"),
+                    )
+                )
+
+            metrics_accumulator = MetricsAccumulator(metric_configs=metric_configs_list)
+            print(f"Validation enabled for {name} with {len(metric_configs_list)} metric(s)")
+
+        # Buffer records for validation
+        buffered_records = []
+
+        # Fetch features with optional metrics collection
+        for record in client.fetch_features(
+            layer_name=name,
+            max_records=max_records,
+            metrics_accumulator=metrics_accumulator,
+        ):
+            if validation_enabled:
+                # Buffer records for validation
+                buffered_records.append(record)
+            else:
+                # No validation - yield immediately
+                yield record
+
+        # Perform validation if enabled
+        if validation_enabled:
+            print(f"\nData fetch completed for {name}. Running validation...")
+
+            # Get tolerance from config FIRST (for fallback)
+            tolerance_percent = validation_config.get("tolerance_percent", 5.0)
+
+            # Check if there are custom metrics to validate
+            if metrics_accumulator is None:
+                # No custom metrics - validate row count only
+                print(f"Validating row count only for {name} (no custom metrics configured)")
+                incoming_metrics = {"row_count": len(buffered_records)}
+                validation_metric_configs = []  # Empty list = only row count validation
+            else:
+                # Get accumulated custom metrics
+                incoming_metrics = metrics_accumulator.get_results()
+                print(f"Incoming metrics: {incoming_metrics}")
+
+                # Prepare metric configs for validator
+                validation_metric_configs = [
+                    {
+                        "name": mc.name,
+                        "aggregate": mc.aggregate,
+                        "parquet_column": mc.name,  # Use normalized name for parquet queries
+                        "tolerance_percent": mc.tolerance_percent or tolerance_percent,  # Fallback to dataset-level
+                    }
+                    for mc in metric_configs_list
+                ]
+
+            # Validate against baseline
+            validation_status = "skipped"
+            try:
+                all_passed, validation_results_list = validator.validate_dataset(
+                    jurisdiction=jurisdiction,
+                    dataset_name=name,
+                    incoming_metrics=incoming_metrics,
+                    metric_configs=validation_metric_configs,
+                    year=current_year,
+                )
+
+                # Check if validation was skipped (no baseline data)
+                if all_passed and len(validation_results_list) == 0:
+                    # No baseline data - first load
+                    validation_status = "no_baseline"
+                    _validation_results.append({
+                        "dataset_name": name,
+                        "jurisdiction": jurisdiction,
+                        "validation_timestamp": datetime.now().isoformat(),
+                        "status": validation_status,
+                        "results": json.dumps({"message": "No baseline data found - first load"}),
+                    })
+                    print(f"✓ No baseline found for {name}. Proceeding with first load.")
+
+                elif not all_passed:
+                    # Validation failed - collect results and raise error
+                    validation_status = "failed"
+                    _validation_results.append({
+                        "dataset_name": name,
+                        "jurisdiction": jurisdiction,
+                        "validation_timestamp": datetime.now().isoformat(),
+                        "status": validation_status,
+                        "results": json.dumps([
+                            {
+                                "metric": r.metric_name,
+                                "baseline": r.baseline_value,
+                                "incoming": r.incoming_value,
+                                "percent_diff": r.percent_difference,
+                                "passed": r.passed,
+                            }
+                            for r in validation_results_list
+                        ]),
+                    })
+                    raise ValidationError(dataset_name=name, results=validation_results_list)
+
+                else:
+                    # Validation passed
+                    validation_status = "passed"
+                    _validation_results.append({
+                        "dataset_name": name,
+                        "jurisdiction": jurisdiction,
+                        "validation_timestamp": datetime.now().isoformat(),
+                        "status": validation_status,
+                        "results": json.dumps([
+                            {
+                                "metric": r.metric_name,
+                                "baseline": r.baseline_value,
+                                "incoming": r.incoming_value,
+                                "percent_diff": r.percent_difference,
+                                "passed": r.passed,
+                            }
+                            for r in validation_results_list
+                        ]),
+                    })
+                    print(f"✓ Validation passed for {name}. Proceeding with load.")
+
+            except Exception as e:
+                # Unexpected error during validation - re-raise
+                print(f"✗ Validation error for {name}: {e}")
+                raise
+
+            # Validation completed (passed, failed was raised, or no baseline) - yield buffered records
+            for record in buffered_records:
+                yield record
 
     return extract_dataset
 
@@ -128,6 +310,7 @@ def run_pipeline(
     dataset_filter: Optional[List[str]] = None,
     skip_geoparquet: bool = False,
     local_output: Optional[Path] = None,
+    skip_validation: bool = False,
 ) -> None:
     """
     Run the ArcGIS extraction pipeline.
@@ -138,6 +321,7 @@ def run_pipeline(
         dataset_filter: Optional list of dataset names to extract (None = all)
         skip_geoparquet: If True, skip geoparquet conversion (write standard parquet only)
         local_output: If provided, write to local filesystem path (auto-limits to 1000 records)
+        skip_validation: If True, skip data validation even if configured
     """
     # Load configuration
     config = load_config(config_path)
@@ -246,15 +430,56 @@ def run_pipeline(
             # Full path for finalizer (includes jurisdiction)
             jurisdiction_data_path = f"{arcgis_bucket_url}/{jurisdiction}"
 
+        # Initialize validator if not in dry-run/local mode
+        validator = None
+        if not dry_run and not local_output and not skip_validation:
+            try:
+                # Get GCS bucket name from dlt secrets
+                base_gcs_bucket_url = dlt.secrets.get("destination.filesystem.bucket_url")
+                # Extract bucket name from gs://bucket/path format
+                bucket_name = base_gcs_bucket_url.replace("gs://", "").split("/")[0]
+
+                # Create validator (uses gcloud auth automatically)
+                validator = DataValidator(
+                    gcs_bucket=bucket_name,
+                    default_tolerance_percent=5.0,
+                )
+                print(f"Validation enabled (bucket: {bucket_name})")
+                print("  Using gcloud application-default credentials for GCS access")
+            except Exception as e:
+                print(f"Warning: Could not initialize validator: {e}")
+                print("Proceeding without validation")
+        elif skip_validation:
+            print("Validation skipped (--skip-validation flag)")
+        else:
+            print("Validation disabled (dry-run or local-output mode)")
+
+        # Clear validation results for this jurisdiction
+        global _validation_results
+        _validation_results = []
+
         # Create metadata registry resource
         metadata_resource = create_metadata_resource(jurisdiction_datasets)
 
         # Create data resources for all datasets in this jurisdiction
         resources = [metadata_resource]  # Start with metadata
         for dataset_config in jurisdiction_datasets:
-            resource = create_arcgis_resource(dataset_config, jurisdiction_crs, max_records)
+            resource = create_arcgis_resource(
+                dataset_config=dataset_config,
+                jurisdiction=jurisdiction,
+                crs=jurisdiction_crs,
+                max_records=max_records,
+                validator=validator,
+                skip_validation=skip_validation,
+                current_year=current_year,
+            )
             resources.append(resource)
             print(f"Configured resource: {dataset_config['name']}")
+
+        # Add validation results resource if validation was enabled
+        if validator is not None and not skip_validation:
+            validation_resource = create_validation_resource()
+            resources.append(validation_resource)
 
         # Run pipeline (loads both metadata and data)
         print(f"\nStarting extraction for {len(resources)} resource(s) (including metadata)...")
@@ -349,6 +574,12 @@ Examples:
         help="Write to local filesystem path for testing (auto-limits to 1000 records)",
     )
 
+    parser.add_argument(
+        "--skip-validation",
+        action="store_true",
+        help="Skip data validation even if configured in YAML",
+    )
+
     args = parser.parse_args()
 
     # Validate config file exists
@@ -363,6 +594,7 @@ Examples:
             dataset_filter=args.datasets,
             skip_geoparquet=args.skip_geoparquet,
             local_output=args.local_output,
+            skip_validation=args.skip_validation,
         )
         return 0
     except Exception as e:

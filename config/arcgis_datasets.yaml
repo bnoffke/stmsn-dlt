@@ -12,6 +12,13 @@ jurisdictions:
       - name: parcels
         layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA2/FeatureServer/0/query"
         description: "Madison parcel boundaries and property information"
+        validation:
+          enabled: true
+          tolerance_percent: 5
+          metrics:
+            - parquet_column: total_taxes  # Column name in normalized parquet files
+              aggregate: sum
+              api_field: TotalTaxes  # Field name in ArcGIS API JSON response
 
       - name: streets
         layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA_ENGR/MapServer/1/query"
@@ -26,5 +33,9 @@ jurisdictions:
         description: "Madison Area Plan Overlays"
 
       - name: alder_district_overlays
-        layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA_ENGR/MapServer/1/query"
+        layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA/MapServer/10/query"
         description: "Madison Alder District Overlays"
+      
+      - name: impervious_surfaces
+        layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA_ENGR/MapServer/7/query"
+        description: "Madison impervious surfaces"

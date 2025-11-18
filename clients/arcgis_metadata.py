@@ -40,6 +40,11 @@ class SpatialMetadata:
     # Timestamps
     extracted_at: Optional[str] = None
 
+    # Validation tracking
+    validation_status: Optional[str] = None  # 'passed', 'failed', 'skipped', 'no_baseline'
+    validation_timestamp: Optional[str] = None
+    validation_details: Optional[str] = None  # JSON string with validation results
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for dlt."""
         return asdict(self)
