@@ -9,4 +9,11 @@ dependencies = [
     "pyarrow>=22.0.0",
     "pyyaml>=6.0",
     "requests>=2.32.5",
+    "shapely>=2.0.0",
 ]
+
+[tool.setuptools]
+packages = ["clients", "pipelines", "utils"]
+
+[tool.uv]
+package = true

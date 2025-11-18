@@ -1,13 +1,30 @@
 # ArcGIS Dataset Configuration
 # Add new datasets here - no code changes required
+#
+# Structure: Jurisdictions contain datasets
+# - CRS is defined at jurisdiction level (drives API requests for native coordinates)
+# - Geometry type is extracted automatically from service metadata
 
-arcgis_datasets:
-  - name: parcels
-    layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA2/FeatureServer/0/query"
-    geometry_type: polygon
-    description: "Madison parcel boundaries and property information"
+jurisdictions:
+  madison:
+    crs: 8193  # NAD83(HARN) / WISCRS Dane County (ftUS)
+    datasets:
+      - name: parcels
+        layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA2/FeatureServer/0/query"
+        description: "Madison parcel boundaries and property information"
 
-  - name: streets
-    layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA_ENGR/MapServer/1/query"
-    geometry_type: linestring
-    description: "Madison street centerlines"
+      - name: streets
+        layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA_ENGR/MapServer/1/query"
+        description: "Madison street centerlines"
+
+      - name: tod_overlay
+        layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA_PLANNING/MapServer/16/query"
+        description: "Madison Transit-Oriented Development Overlay Zoning District Boundary"
+
+      - name: area_plan_overlays
+        layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA_PLANNING/MapServer/18/query"
+        description: "Madison Area Plan Overlays"
+
+      - name: alder_district_overlays
+        layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA_ENGR/MapServer/1/query"
+        description: "Madison Alder District Overlays"

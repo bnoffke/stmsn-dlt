@@ -1,14 +1,14 @@
 # dlt Configuration File
 # Non-sensitive configuration settings (safe to commit)
 
+# Pipeline-level settings
+[pipeline]
+loader_file_format = "parquet"
+
 # Filesystem destination settings for GeoParquet output
 [destination.filesystem]
 # Layout for parquet files - using hive partitioning by year
-layout = "{table_name}/year={year}/{file_id}.{ext}"
-
-# Data writer settings
-[destination.filesystem.data_writer]
-file_format = "parquet"
+layout = "{table_name}/year={YYYY}/{file_id}.{ext}"
 
 # Parquet compression and performance settings
 [destination.filesystem.data_writer.parquet]

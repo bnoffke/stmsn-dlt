@@ -20,142 +20,76 @@ Usage:
 """
 
 import argparse
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
-from urllib.parse import urlencode
 
 import dlt
-import requests
 import yaml
 
+from clients.arcgis import ArcGISClient
+from clients.arcgis_metadata import ArcGISMetadataExtractor
+from utils.geoparquet_finalizer import GeoParquetFinalizer
 
-class ArcGISClient:
-    """Client for extracting data from ArcGIS REST API with pagination and retry logic."""
 
-    def __init__(
-        self,
-        base_url: str,
-        page_size: int = 1000,
-        max_retries: int = 3,
-        retry_delay: float = 1.0,
-        request_delay: float = 0.1,
-    ):
-        """
-        Initialize ArcGIS REST API client.
+def create_metadata_resource(datasets: List[Dict[str, Any]]):
+    """
+    Create a dlt resource for spatial metadata registry.
 
-        Args:
-            base_url: Base URL of the ArcGIS layer query endpoint
-            page_size: Number of records per page (resultRecordCount)
-            max_retries: Maximum number of retry attempts for failed requests
-            retry_delay: Delay in seconds between retries
-            request_delay: Delay in seconds between successful requests (rate limiting)
-        """
-        self.base_url = base_url
-        self.page_size = page_size
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-        self.request_delay = request_delay
-        self.session = requests.Session()
+    This resource extracts metadata from all configured datasets
+    and stores it in a tracking table for the geoparquet finalizer.
 
-    def fetch_features(
-        self, layer_name: str, max_records: Optional[int] = None
-    ) -> Iterator[Dict[str, Any]]:
-        """
-        Fetch all features from an ArcGIS layer with automatic pagination.
+    Args:
+        datasets: List of dataset configurations
 
-        Args:
-            layer_name: Name of the layer (for logging)
-            max_records: Optional limit on total records to fetch (for testing)
+    Returns:
+        dlt resource for metadata extraction
+    """
 
-        Yields:
-            Individual feature dictionaries with geometry and properties
-        """
-        offset = 0
-        total_fetched = 0
+    @dlt.resource(
+        name="spatial_metadata_registry",
+        write_disposition="replace",
+        primary_key="dataset_name",
+    )
+    def extract_metadata() -> Iterator[Dict[str, Any]]:
+        """Extract spatial metadata from all ArcGIS services."""
+        extractor = ArcGISMetadataExtractor()
 
-        while True:
-            # Build query parameters
-            params = {
-                "where": "1=1",  # Select all records
-                "outFields": "*",  # All fields
-                "f": "geojson",  # GeoJSON format
-                "resultRecordCount": self.page_size,
-                "resultOffset": offset,
-            }
+        for dataset_config in datasets:
+            name = dataset_config["name"]
+            layer_url = dataset_config["layer_url"]
 
-            url = f"{self.base_url}?{urlencode(params)}"
+            print(f"Extracting metadata for {name}...")
 
-            # Retry logic
-            for attempt in range(self.max_retries):
-                try:
-                    response = self.session.get(url, timeout=30)
-                    response.raise_for_status()
-                    data = response.json()
-                    break
-                except (requests.RequestException, ValueError) as e:
-                    if attempt == self.max_retries - 1:
-                        print(
-                            f"Error fetching {layer_name} at offset {offset} "
-                            f"after {self.max_retries} attempts: {e}"
-                        )
-                        raise
-                    print(
-                        f"Retry {attempt + 1}/{self.max_retries} for {layer_name} "
-                        f"at offset {offset}: {e}"
-                    )
-                    time.sleep(self.retry_delay * (attempt + 1))
-
-            # Parse GeoJSON features
-            features = data.get("features", [])
-
-            if not features:
-                # No more data
-                break
-
-            # Yield individual features
-            for feature in features:
-                # Check if we've hit the record limit
-                if max_records is not None and total_fetched >= max_records:
-                    print(
-                        f"Reached limit of {max_records} records for {layer_name} "
-                        "(sampling mode)"
-                    )
-                    return
-
-                # Flatten GeoJSON structure: merge properties with geometry
-                record = {
-                    "geometry": feature.get("geometry"),
-                    **feature.get("properties", {}),
+            try:
+                metadata = extractor.extract_metadata(layer_url, name)
+                yield metadata.to_dict()
+            except Exception as e:
+                print(f"Warning: Failed to extract metadata for {name}: {e}")
+                # Yield minimal metadata so we don't fail the entire pipeline
+                yield {
+                    "dataset_name": name,
+                    "source_url": layer_url,
+                    "extracted_at": datetime.now().isoformat(),
+                    "geometry_type": dataset_config.get(
+                        "geometry_type"
+                    ),  # fallback to config
                 }
-                yield record
-                total_fetched += 1
 
-            print(f"Fetched {total_fetched} records from {layer_name}...")
-
-            # Move to next page
-            offset += len(features)
-
-            # Rate limiting
-            time.sleep(self.request_delay)
-
-            # If we got fewer records than page_size, we're done
-            if len(features) < self.page_size:
-                break
-
-        print(f"Completed {layer_name}: {total_fetched} total records")
+    return extract_metadata
 
 
 def create_arcgis_resource(
-    dataset_config: Dict[str, Any], current_year: int, max_records: Optional[int] = None
+    dataset_config: Dict[str, Any],
+    crs: Optional[int] = None,
+    max_records: Optional[int] = None
 ):
     """
     Create a dlt resource for an ArcGIS dataset.
 
     Args:
         dataset_config: Dataset configuration from YAML (name, layer_url, etc.)
-        current_year: Current year for partitioning
+        crs: CRS EPSG code to request from ArcGIS (e.g., 8193 for Madison)
         max_records: Optional limit on records to fetch (for testing/sampling)
 
     Returns:
@@ -163,18 +97,19 @@ def create_arcgis_resource(
     """
     name = dataset_config["name"]
     layer_url = dataset_config["layer_url"]
-    geometry_type = dataset_config.get("geometry_type", "unknown")
 
-    @dlt.resource(name=name, write_disposition="replace")
+    @dlt.resource(
+        name=name,
+        write_disposition="replace",
+        columns={"geometry": {"data_type": "text"}},  # Treat WKB hex as text
+    )
     def extract_dataset() -> Iterator[Dict[str, Any]]:
-        """Extract data from ArcGIS REST API and add year partition."""
-        client = ArcGISClient(base_url=layer_url)
+        """Extract data from ArcGIS REST API with WKB geometry."""
+        client = ArcGISClient(base_url=layer_url, convert_to_wkb=True, output_crs=crs)
 
         for record in client.fetch_features(layer_name=name, max_records=max_records):
-            # Add partition column
-            record["year"] = current_year
-            # Add geometry type for downstream processing
-            record["_geometry_type"] = geometry_type
+            # Year partition comes from Hive path layout, not data
+            # (layout in .dlt/config.toml: "{table_name}/year={YYYY}/{file_id}.{ext}")
             yield record
 
     return extract_dataset
@@ -191,6 +126,8 @@ def run_pipeline(
     config_path: Path,
     dry_run: bool = False,
     dataset_filter: Optional[List[str]] = None,
+    skip_geoparquet: bool = False,
+    local_output: Optional[Path] = None,
 ) -> None:
     """
     Run the ArcGIS extraction pipeline.
@@ -199,70 +136,160 @@ def run_pipeline(
         config_path: Path to dataset configuration YAML
         dry_run: If True, use DuckDB destination for local testing
         dataset_filter: Optional list of dataset names to extract (None = all)
+        skip_geoparquet: If True, skip geoparquet conversion (write standard parquet only)
+        local_output: If provided, write to local filesystem path (auto-limits to 1000 records)
     """
     # Load configuration
     config = load_config(config_path)
-    datasets = config.get("arcgis_datasets", [])
+    jurisdictions = config.get("jurisdictions", {})
 
-    if not datasets:
-        print("No datasets configured in YAML file")
+    if not jurisdictions:
+        print("No jurisdictions configured in YAML file")
         return
-
-    # Filter datasets if specified
-    if dataset_filter:
-        datasets = [d for d in datasets if d["name"] in dataset_filter]
-        if not datasets:
-            print(f"No datasets matched filter: {dataset_filter}")
-            return
 
     # Get current year for partitioning
     current_year = datetime.now().year
 
-    # Set record limit for dry-run mode (sampling)
-    max_records = 1000 if dry_run else None
+    # Set record limit for dry-run or local-output mode (sampling)
+    max_records = 1000 if (dry_run or local_output) else None
 
-    # Create dlt pipeline
+    # Flatten datasets with jurisdiction info for filtering
+    all_datasets = []
+    for jurisdiction_name, jurisdiction_config in jurisdictions.items():
+        jurisdiction_crs = jurisdiction_config.get("crs")
+        for dataset in jurisdiction_config.get("datasets", []):
+            # Add jurisdiction context to each dataset
+            dataset_with_context = {
+                **dataset,
+                "jurisdiction": jurisdiction_name,
+                "jurisdiction_crs": jurisdiction_crs,
+            }
+            all_datasets.append(dataset_with_context)
+
+    # Filter datasets if specified
+    if dataset_filter:
+        all_datasets = [d for d in all_datasets if d["name"] in dataset_filter]
+        if not all_datasets:
+            print(f"No datasets matched filter: {dataset_filter}")
+            return
+
+    # Group datasets by jurisdiction
+    datasets_by_jurisdiction = {}
+    for dataset in all_datasets:
+        jurisdiction = dataset["jurisdiction"]
+        if jurisdiction not in datasets_by_jurisdiction:
+            datasets_by_jurisdiction[jurisdiction] = {
+                "crs": dataset["jurisdiction_crs"],
+                "datasets": []
+            }
+        datasets_by_jurisdiction[jurisdiction]["datasets"].append(dataset)
+
+    print(f"Found {len(datasets_by_jurisdiction)} jurisdiction(s): {', '.join(datasets_by_jurisdiction.keys())}")
+
+    # Process each jurisdiction separately
+    for jurisdiction, jurisdiction_data in datasets_by_jurisdiction.items():
+        print(f"\n{'=' * 60}")
+        print(f"Processing jurisdiction: {jurisdiction}")
+        print(f"CRS: EPSG:{jurisdiction_data['crs']}")
+        print(f"{'=' * 60}")
+
+        jurisdiction_crs = jurisdiction_data["crs"]
+        jurisdiction_datasets = jurisdiction_data["datasets"]
+
+        # Create dlt pipeline
+        if dry_run:
+            print("Running in DRY-RUN mode with DuckDB destination")
+            print(f"Sampling mode: limiting to {max_records} records per dataset")
+            pipeline = dlt.pipeline(
+                pipeline_name=f"arcgis_{jurisdiction}_test",
+                destination="duckdb",
+                dataset_name=jurisdiction,
+            )
+        elif local_output:
+            print("Running with LOCAL FILESYSTEM destination")
+            print(f"Sampling mode: limiting to {max_records} records per dataset")
+
+            # Create local path structure: {local_output}/arcgis
+            # Dataset name (jurisdiction) will be appended by dlt
+            base_bucket_url = f"{local_output.absolute()}/arcgis"
+
+            print(f"Local output path: {base_bucket_url}/{jurisdiction}")
+
+            pipeline = dlt.pipeline(
+                pipeline_name=f"arcgis_{jurisdiction}_local",
+                destination=dlt.destinations.filesystem(bucket_url=base_bucket_url),
+                dataset_name=jurisdiction,
+            )
+
+            # Full path for finalizer (includes jurisdiction)
+            jurisdiction_data_path = f"{base_bucket_url}/{jurisdiction}"
+        else:
+            print("Running with GCS filesystem destination")
+
+            # Get base bucket URL from dlt secrets
+            # Expected format in secrets.toml: bucket_url = "gs://${BUCKET_NAME}/bronze"
+            base_gcs_bucket_url = dlt.secrets.get("destination.filesystem.bucket_url")
+
+            # Inject source (arcgis) into path
+            # Dataset name (jurisdiction) will be appended by dlt
+            # Result: gs://${BUCKET_NAME}/bronze/arcgis/{jurisdiction}
+            arcgis_bucket_url = f"{base_gcs_bucket_url.rstrip('/')}/arcgis"
+
+            print(f"Bucket URL: {arcgis_bucket_url}/{jurisdiction}")
+
+            pipeline = dlt.pipeline(
+                pipeline_name=f"arcgis_{jurisdiction}",
+                destination=dlt.destinations.filesystem(bucket_url=arcgis_bucket_url),
+                dataset_name=jurisdiction,
+            )
+
+            # Full path for finalizer (includes jurisdiction)
+            jurisdiction_data_path = f"{arcgis_bucket_url}/{jurisdiction}"
+
+        # Create metadata registry resource
+        metadata_resource = create_metadata_resource(jurisdiction_datasets)
+
+        # Create data resources for all datasets in this jurisdiction
+        resources = [metadata_resource]  # Start with metadata
+        for dataset_config in jurisdiction_datasets:
+            resource = create_arcgis_resource(dataset_config, jurisdiction_crs, max_records)
+            resources.append(resource)
+            print(f"Configured resource: {dataset_config['name']}")
+
+        # Run pipeline (loads both metadata and data)
+        print(f"\nStarting extraction for {len(resources)} resource(s) (including metadata)...")
+        print(f"Year partition: {current_year}")
+        print("-" * 60)
+
+        load_info = pipeline.run(resources, loader_file_format="parquet")
+
+        # Print results
+        print("-" * 60)
+        print(f"Jurisdiction '{jurisdiction}' completed successfully!")
+        print(f"Loaded {len(load_info.loads_ids)} load(s)")
+        print(f"Pipeline name: {load_info.pipeline.pipeline_name}")
+
+        # Post-processing: Convert to geoparquet
+        if not dry_run and not skip_geoparquet:
+            print("\n" + "=" * 60)
+            print("Starting geoparquet conversion...")
+            print("=" * 60)
+
+            try:
+                finalizer = GeoParquetFinalizer(jurisdiction_data_path, jurisdiction)
+                finalizer.process_all_datasets(in_place=True)
+            except Exception as e:
+                print(f"\nWarning: Geoparquet conversion failed: {e}")
+                print("Standard parquet files are still available")
+                import traceback
+                traceback.print_exc()
+
     if dry_run:
-        print("Running in DRY-RUN mode with DuckDB destination")
-        print(f"Sampling mode: limiting to {max_records} records per dataset")
-        pipeline = dlt.pipeline(
-            pipeline_name="arcgis_test",
-            destination="duckdb",
-            dataset_name="arcgis_data",
-        )
-    else:
-        print("Running with GCS filesystem destination")
-        pipeline = dlt.pipeline(
-            pipeline_name="arcgis_pipeline",
-            destination="filesystem",
-            dataset_name="arcgis",
-        )
-
-    # Create resources for all configured datasets
-    resources = []
-    for dataset_config in datasets:
-        resource = create_arcgis_resource(dataset_config, current_year, max_records)
-        resources.append(resource)
-        print(f"Configured resource: {dataset_config['name']}")
-
-    # Run pipeline
-    print(f"\nStarting extraction for {len(resources)} dataset(s)...")
-    print(f"Year partition: {current_year}")
-    print("-" * 60)
-
-    load_info = pipeline.run(resources)
-
-    # Print results
-    print("-" * 60)
-    print("Pipeline completed successfully!")
-    print(f"Loaded {len(load_info.loads_ids)} load(s)")
-    print(f"Pipeline name: {load_info.pipeline.pipeline_name}")
-
-    if dry_run:
-        print("\nDRY-RUN: Data loaded to local DuckDB")
+        print("\n" + "=" * 60)
+        print("DRY-RUN: Data loaded to local DuckDB")
         print("To query data, use:")
         print("  import dlt")
-        print("  pipeline = dlt.pipeline(pipeline_name='arcgis_test', destination='duckdb')")
+        print("  pipeline = dlt.pipeline(pipeline_name='arcgis_madison_test', destination='duckdb')")
         print("  dataset = pipeline.dataset()")
         print("  print(dataset.parcels.df())  # Example for parcels")
 
@@ -274,11 +301,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run with default config
+  # Run with default config (production GCS)
   uv run pipelines/arcgis.py
 
-  # Test locally with DuckDB
+  # Test with DuckDB (SQL queries)
   uv run pipelines/arcgis.py --dry-run
+
+  # Test with local filesystem (actual parquet files, 1000 records)
+  uv run pipelines/arcgis.py --local-output ./test_output --datasets parcels
 
   # Extract specific datasets
   uv run pipelines/arcgis.py --datasets parcels streets
@@ -307,6 +337,18 @@ Examples:
         help="Extract only specified datasets (default: all)",
     )
 
+    parser.add_argument(
+        "--skip-geoparquet",
+        action="store_true",
+        help="Skip geoparquet conversion (write standard parquet only)",
+    )
+
+    parser.add_argument(
+        "--local-output",
+        type=Path,
+        help="Write to local filesystem path for testing (auto-limits to 1000 records)",
+    )
+
     args = parser.parse_args()
 
     # Validate config file exists
@@ -319,6 +361,8 @@ Examples:
             config_path=args.config,
             dry_run=args.dry_run,
             dataset_filter=args.datasets,
+            skip_geoparquet=args.skip_geoparquet,
+            local_output=args.local_output,
         )
         return 0
     except Exception as e:

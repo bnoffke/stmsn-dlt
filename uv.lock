@@ -1635,7 +1635,7 @@ wheels = [
 [[package]]
 name = "stmsn-dlt"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "dlt", extra = ["duckdb", "gcp"] },
     { name = "geopandas" },
@@ -1643,6 +1643,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "pyyaml" },
     { name = "requests" },
+    { name = "shapely" },
 ]
 
 [package.metadata]
@@ -1653,6 +1654,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=22.0.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "requests", specifier = ">=2.32.5" },
+    { name = "shapely", specifier = ">=2.0.0" },
 ]
 
 [[package]]
