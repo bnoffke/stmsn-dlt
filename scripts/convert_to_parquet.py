@@ -6,14 +6,22 @@
 #     "pyarrow",
 #     "geopandas",
 #     "shapely",
+#     "openpyxl",
 # ]
 # ///
 """
-Convert CSV, TSV, GeoJSON, and Shapefile files to Parquet/GeoParquet format.
+Convert CSV, TSV, GeoJSON, Shapefile, and Excel files to Parquet/GeoParquet format.
 
 Usage:
     uv run convert_to_parquet.py <directory> [--force] [--verbose]
-    
+
+Supported formats:
+    - CSV (.csv)
+    - TSV (.txt)
+    - GeoJSON (.geojson)
+    - Shapefile (.shp)
+    - Excel (.xlsx, .xls)
+
 Options:
     --force     Overwrite existing parquet files
     --verbose   Show detailed progress information
@@ -255,12 +263,62 @@ def convert_shapefile_to_geoparquet(file_path: Path, verbose: bool = False) -> N
     """Convert Shapefile to GeoParquet."""
     output_path = normalize_filename(file_path)
     print(f"Converting {file_path.name}")
-    
+
     gdf = gpd.read_file(file_path)
     gdf.to_parquet(output_path, index=False)
-    
+
     if verbose:
         print(f"  ✓ Success")
+
+
+def find_header_row(df: pd.DataFrame) -> int:
+    """Find the header row by identifying first row with ≥3 non-empty cells."""
+    for i, row in df.iterrows():
+        non_empty_cells = row.notna().sum()
+        if non_empty_cells >= 3:
+            return i
+    raise ValueError("Header row not found (no row with ≥3 non-empty cells)")
+
+
+def convert_excel_to_parquet(file_path: Path, verbose: bool = False) -> None:
+    """Convert Excel file to Parquet using dynamic header detection.
+
+    Reads the first sheet only and automatically detects the header row
+    by finding the first row with at least 3 non-empty cells.
+    """
+    output_path = normalize_filename(file_path)
+    print(f"Converting {file_path.name}")
+
+    try:
+        # Attempt 1: Read all as strings (safest approach)
+        if verbose:
+            print(f"  Reading first sheet with dtype=str")
+
+        df = pd.read_excel(file_path, sheet_name=0, header=None, dtype=str)
+
+        # Find and set header row
+        header_row = find_header_row(df)
+        if verbose:
+            print(f"  Found header row at index {header_row}")
+
+        df.columns = df.iloc[header_row]
+        df = df.iloc[header_row + 1:]
+        df = df.replace({pd.NA: None})
+        df = df.reset_index(drop=True)
+
+        # Write to parquet
+        df.to_parquet(output_path, engine='pyarrow', index=False)
+        if verbose:
+            print(f"  ✓ Success ({len(df)} rows, {len(df.columns)} columns)")
+        return
+
+    except ValueError as e:
+        # Header row not found
+        raise Exception(f"Invalid Excel format: {e}")
+
+    except Exception as e:
+        # Other errors (file corrupt, wrong format, etc.)
+        raise Exception(f"Failed to convert Excel file: {e}")
 
 
 def process_directory(directory: Path, force: bool = False, verbose: bool = False) -> None:
@@ -270,6 +328,8 @@ def process_directory(directory: Path, force: bool = False, verbose: bool = Fals
         '.geojson': convert_geojson_to_geoparquet,
         '.shp': convert_shapefile_to_geoparquet,
         '.txt': convert_tsv_to_parquet,
+        '.xlsx': convert_excel_to_parquet,
+        '.xls': convert_excel_to_parquet,
     }
     
     files_converted = 0
@@ -314,9 +374,9 @@ def process_directory(directory: Path, force: bool = False, verbose: bool = Fals
 
 def main():
     import argparse
-    
+
     parser = argparse.ArgumentParser(
-        description="Convert CSV, TSV, GeoJSON, and Shapefile files to Parquet/GeoParquet"
+        description="Convert CSV, TSV, GeoJSON, Shapefile, and Excel files to Parquet/GeoParquet"
     )
     parser.add_argument("directory", help="Directory to process recursively")
     parser.add_argument("--force", action="store_true", help="Overwrite existing parquet files")

@@ -86,11 +86,16 @@ def create_metadata_resource(datasets: List[Dict[str, Any]]):
         for dataset_config in datasets:
             name = dataset_config["name"]
             layer_url = dataset_config["layer_url"]
+            non_spatial = dataset_config.get("non_spatial", False)
 
             print(f"Extracting metadata for {name}...")
 
+            if non_spatial:
+                print(f"  Dataset marked as non-spatial, will skip geoparquet conversion")
+
             try:
                 metadata = extractor.extract_metadata(layer_url, name)
+                metadata.non_spatial = non_spatial
                 yield metadata.to_dict()
             except Exception as e:
                 print(f"Warning: Failed to extract metadata for {name}: {e}")
@@ -102,6 +107,7 @@ def create_metadata_resource(datasets: List[Dict[str, Any]]):
                     "geometry_type": dataset_config.get(
                         "geometry_type"
                     ),  # fallback to config
+                    "non_spatial": non_spatial,
                 }
 
     return extract_metadata

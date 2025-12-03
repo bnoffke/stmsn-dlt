@@ -39,3 +39,15 @@ jurisdictions:
       - name: impervious_surfaces
         layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DATA_ENGR/MapServer/7/query"
         description: "Madison impervious surfaces"
+
+      - name: tax_roll
+        layer_url: "https://maps.cityofmadison.com/arcgis/rest/services/Public/OPEN_DB_TABLES/MapServer/4/query"
+        description: "Madison tax roll data"
+        non_spatial: true
+        validation:
+          enabled: true
+          tolerance_percent: 5
+          metrics:
+            - parquet_column: cur_total  # Column name in normalized parquet files
+              aggregate: sum
+              api_field: CurTotal  # Field name in ArcGIS API JSON response

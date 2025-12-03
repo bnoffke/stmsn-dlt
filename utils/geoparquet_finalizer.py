@@ -213,14 +213,40 @@ class GeoParquetFinalizer:
             input_file: Path to input parquet file
             output_file: Path to output geoparquet file
             metadata: Spatial metadata dict from registry
+
+        Raises:
+            ValueError: If dataset is marked spatial but has no CRS metadata
         """
+        # Validate spatial metadata is present for spatial datasets
+        is_non_spatial = metadata.get("non_spatial", False)
+        has_crs_metadata = (
+            metadata.get("crs_epsg")
+            or metadata.get("crs_wkid")
+            or metadata.get("crs_wkt")
+        )
+
+        if not is_non_spatial and not has_crs_metadata:
+            raise ValueError(
+                f"Dataset '{metadata.get('dataset_name')}' is marked as spatial "
+                f"(non_spatial flag absent or false) but has no CRS metadata "
+                f"(crs_epsg, crs_wkid, or crs_wkt). If this dataset has no spatial data, "
+                f"add 'non_spatial: true' to its YAML config. Otherwise, check the "
+                f"ArcGIS service metadata extraction."
+            )
+
         # Read parquet file with dictionary normalization
         df = self.read_parquet_normalized(input_file)
 
         # Check if geometry column exists
         if "geometry" not in df.columns:
-            print(f"    Warning: No geometry column found in {input_file}, skipping")
-            return
+            if not is_non_spatial:
+                raise ValueError(
+                    f"No geometry column found in {input_file}. "
+                    f"If this dataset has no spatial data, add 'non_spatial: true' to its YAML config."
+                )
+            else:
+                print(f"    Warning: No geometry column found in {input_file}, skipping")
+                return
 
         # Convert WKB hex to shapely geometries
         print(f"    Converting WKB to geometries...")
@@ -330,6 +356,15 @@ class GeoParquetFinalizer:
         for _, row in metadata_df.iterrows():
             dataset_name = row["dataset_name"]
             metadata = row.to_dict()
+
+            # Check non_spatial flag
+            if metadata.get("non_spatial", False):
+                print(f"\n{'=' * 60}")
+                print(f"Skipping dataset: {dataset_name}")
+                print(f"  Reason: Dataset marked as non_spatial=true in config")
+                print(f"  Standard parquet files remain available")
+                print(f"{'=' * 60}")
+                continue
 
             self.process_dataset(dataset_name, metadata, in_place=in_place)
 

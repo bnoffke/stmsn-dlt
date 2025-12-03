@@ -17,6 +17,7 @@ class SpatialMetadata:
 
     dataset_name: str
     source_url: str
+    non_spatial: bool = False  # Flag for non-spatial datasets
 
     # Spatial reference
     crs_epsg: Optional[int] = None
