@@ -1,0 +1,28 @@
+# Web Files Dataset Configuration
+# Configuration-driven pipeline for downloading Excel/CSV files from web URLs
+#
+# Structure: Jurisdictions contain datasets with URL patterns and partition config
+
+jurisdictions:
+  madison:
+    datasets:
+      - name: tax_roll
+        description: "Madison tax roll data from City of Madison Finance Department"
+        base_url: "https://www.cityofmadison.com/finance/documents/treasury/tax-roll/"
+        file_type: xlsx
+
+        # URL patterns to try (in order) - {year} is replaced with year value
+        url_patterns:
+          - "{year}taxroll.xlsx"      # e.g., 2024taxroll.xlsx
+          - "TaxRoll{year}.xlsx"      # e.g., TaxRoll2023.xlsx
+
+        # Hive partitioning configuration (list for nested partitions)
+        partition:
+          - field: year
+            source: filename           # extract from filename
+            pattern: "\\d{4}"          # regex to extract value
+
+        # Excel-specific settings
+        excel:
+          sheet: 0                     # Sheet index or name (default: 0)
+          header_detection: auto       # auto (find first row with 3+ values) or row number
