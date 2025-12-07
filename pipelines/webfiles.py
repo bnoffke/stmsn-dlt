@@ -22,6 +22,7 @@ Usage:
 import argparse
 import os
 import tempfile
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
@@ -102,7 +103,7 @@ def create_data_resource(
 
     @dlt.resource(
         name=dataset_name,
-        write_disposition="replace",
+        write_disposition="append",
     )
     def extract_data() -> Iterator[Dict[str, Any]]:
         """Yield data records."""
@@ -216,8 +217,8 @@ def run_pipeline(
                 )
 
         # Collect resources to run
-        resources = []
-        total_files = 0
+        # First, collect all files from all datasets with their config
+        all_files_with_config = []
 
         for dataset_config in jurisdiction_datasets:
             dataset_name = dataset_config["name"]
@@ -274,11 +275,42 @@ def run_pipeline(
                 print("No new files to process")
                 continue
 
-            print(f"Processing {len(files_to_process)} file(s)...")
+            print(f"Found {len(files_to_process)} file(s) to process")
 
-            # Process each file
+            # Add files with their config to the collection
             for discovered_file in files_to_process:
+                all_files_with_config.append((discovered_file, dataset_config))
+
+        if not all_files_with_config:
+            print("\nNo files to load for this jurisdiction")
+            continue
+
+        # Group files by partition values
+        files_by_partition = defaultdict(list)
+        for discovered_file, dataset_config in all_files_with_config:
+            # Create hashable key from partition values
+            partition_key = tuple(sorted(discovered_file.partition_values.items()))
+            files_by_partition[partition_key].append((discovered_file, dataset_config))
+
+        print(f"\n--- Found {len(files_by_partition)} unique partition combination(s) ---")
+
+        # Process each partition group separately
+        for partition_key, partition_files in files_by_partition.items():
+            partition_values = dict(partition_key)
+            print(f"\n--- Processing partition: {partition_values} ---")
+            print(f"Files in this partition: {len(partition_files)}")
+
+            resources = []
+            total_files = 0
+
+            # Process each file in this partition group
+            for discovered_file, dataset_config in partition_files:
+                dataset_name = dataset_config["name"]
+                file_type = dataset_config["file_type"]
+                excel_config = dataset_config.get("excel", {})
+
                 print(f"\nFile: {discovered_file.filename}")
+                print(f"Dataset: {dataset_name}")
                 print(f"Partitions: {discovered_file.partition_values}")
 
                 try:
@@ -289,7 +321,6 @@ def run_pipeline(
                     )
 
                     # Create resource for this file
-                    # Use partition values in the table name for proper partitioning
                     resource, row_count = create_data_resource(
                         dataset_name=dataset_name,
                         file_path=local_path,
@@ -328,72 +359,75 @@ def run_pipeline(
                     print(f"ERROR processing file: {e}")
                     continue
 
-        if not resources:
-            print("\nNo files to load for this jurisdiction")
-            continue
+            if not resources:
+                print("No files successfully processed for this partition")
+                continue
 
-        # Add load history resource if we have a history manager
-        if history_manager and history_manager.get_pending_records():
-            resources.append(create_load_history_resource(history_manager))
+            # Add load history resource if we have a history manager
+            if history_manager and history_manager.get_pending_records():
+                resources.append(create_load_history_resource(history_manager))
 
-        # Create and run dlt pipeline
-        print(f"\n--- Loading {total_files} file(s) to destination ---")
+            # Create and run dlt pipeline for this partition group
+            print(f"\n--- Loading {total_files} file(s) to destination ---")
 
-        # Build layout from first dataset's partition config
-        # (assumes all datasets in jurisdiction have same partition structure)
-        first_dataset = jurisdiction_datasets[0]
-        partition_config = first_dataset.get("partition", [{"field": "year"}])
-        layout = build_layout(partition_config)
-        print(f"Layout: {layout}")
+            # Build layout from first dataset's partition config
+            # (assumes all datasets in jurisdiction have same partition structure)
+            first_dataset = jurisdiction_datasets[0]
+            partition_config = first_dataset.get("partition", [{"field": "year"}])
+            layout = build_layout(partition_config)
+            print(f"Layout: {layout}")
+            print(f"Partition placeholders: {partition_values}")
 
-        if dry_run:
-            print("Running in DRY-RUN mode with DuckDB destination")
-            pipeline = dlt.pipeline(
-                pipeline_name=f"webfiles_{jurisdiction}_test",
-                destination="duckdb",
-                dataset_name=jurisdiction,
-            )
-        elif local_output:
-            print("Running with LOCAL FILESYSTEM destination")
-            base_bucket_url = f"{local_output.absolute()}/webfiles"
-            print(f"Local output path: {base_bucket_url}/{jurisdiction}")
+            if dry_run:
+                print("Running in DRY-RUN mode with DuckDB destination")
+                pipeline = dlt.pipeline(
+                    pipeline_name=f"webfiles_{jurisdiction}_test",
+                    destination="duckdb",
+                    dataset_name=jurisdiction,
+                )
+            elif local_output:
+                print("Running with LOCAL FILESYSTEM destination")
+                base_bucket_url = f"{local_output.absolute()}/webfiles"
+                print(f"Local output path: {base_bucket_url}/{jurisdiction}")
 
-            pipeline = dlt.pipeline(
-                pipeline_name=f"webfiles_{jurisdiction}_local",
-                destination=dlt.destinations.filesystem(
-                    bucket_url=base_bucket_url,
-                    layout=layout,
-                ),
-                dataset_name=jurisdiction,
-            )
-        else:
-            print("Running with GCS filesystem destination")
-            base_gcs_bucket_url = dlt.secrets.get("destination.filesystem.bucket_url")
-            webfiles_bucket_url = f"{base_gcs_bucket_url.rstrip('/')}/webfiles"
-            print(f"Bucket URL: {webfiles_bucket_url}/{jurisdiction}")
+                pipeline = dlt.pipeline(
+                    pipeline_name=f"webfiles_{jurisdiction}_local",
+                    destination=dlt.destinations.filesystem(
+                        bucket_url=base_bucket_url,
+                        layout=layout,
+                        extra_placeholders=partition_values,
+                    ),
+                    dataset_name=jurisdiction,
+                )
+            else:
+                print("Running with GCS filesystem destination")
+                base_gcs_bucket_url = dlt.secrets.get("destination.filesystem.bucket_url")
+                webfiles_bucket_url = f"{base_gcs_bucket_url.rstrip('/')}/webfiles"
+                print(f"Bucket URL: {webfiles_bucket_url}/{jurisdiction}")
 
-            pipeline = dlt.pipeline(
-                pipeline_name=f"webfiles_{jurisdiction}",
-                destination=dlt.destinations.filesystem(
-                    bucket_url=webfiles_bucket_url,
-                    layout=layout,
-                ),
-                dataset_name=jurisdiction,
-            )
+                pipeline = dlt.pipeline(
+                    pipeline_name=f"webfiles_{jurisdiction}",
+                    destination=dlt.destinations.filesystem(
+                        bucket_url=webfiles_bucket_url,
+                        layout=layout,
+                        extra_placeholders=partition_values,
+                    ),
+                    dataset_name=jurisdiction,
+                )
 
-        # Run pipeline
-        try:
-            load_info = pipeline.run(resources)
-            print(f"\nLoad completed successfully!")
-            print(load_info)
+            # Run pipeline
+            try:
+                load_info = pipeline.run(resources, loader_file_format="parquet")
+                print(f"\nLoad completed successfully!")
+                print(load_info)
 
-            # Clear pending history after successful load
-            if history_manager:
-                history_manager.clear_pending()
+                # Clear pending history after successful load
+                if history_manager:
+                    history_manager.clear_pending()
 
-        except Exception as e:
-            print(f"Pipeline load failed: {e}")
-            raise
+            except Exception as e:
+                print(f"Pipeline load failed: {e}")
+                raise
 
     # Clean up
     web_client.close()

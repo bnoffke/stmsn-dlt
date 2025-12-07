@@ -79,7 +79,11 @@ class LoadHistoryManager:
             jurisdiction: Optional filter by jurisdiction
             dataset_name: Optional filter by dataset name
         """
-        history_path = self._get_history_path()
+        # Build path with jurisdiction (DLT writes to {bucket}/{pipeline}/{dataset}/table_name/)
+        if jurisdiction:
+            history_path = f"gcs://{self.gcs_bucket}/{self.pipeline_name}/{jurisdiction}/load_history/*.parquet"
+        else:
+            history_path = self._get_history_path()
 
         try:
             conn = duckdb.connect(":memory:")
