@@ -50,6 +50,8 @@ class LoadHistoryManager:
         self.pipeline_name = pipeline_name
         self._loaded_urls: Set[str] = set()
         self._pending_records: List[LoadHistoryRecord] = []
+        self._jurisdiction: Optional[str] = None
+        self._dataset_name: Optional[str] = None
 
     def _init_duckdb_gcs(self, conn: duckdb.DuckDBPyConnection) -> None:
         """
@@ -65,7 +67,7 @@ class LoadHistoryManager:
 
     def _get_history_path(self) -> str:
         """Get GCS path to load history parquet files."""
-        return f"gcs://{self.gcs_bucket}/{self.pipeline_name}/load_history/*.parquet"
+        return f"gcs://{self.gcs_bucket}/{self.pipeline_name}/load_history/**/*.parquet"
 
     def load_existing_history(
         self,
@@ -79,9 +81,13 @@ class LoadHistoryManager:
             jurisdiction: Optional filter by jurisdiction
             dataset_name: Optional filter by dataset name
         """
+        # Store jurisdiction and dataset for use by other methods
+        self._jurisdiction = jurisdiction
+        self._dataset_name = dataset_name
+
         # Build path with jurisdiction (DLT writes to {bucket}/{pipeline}/{dataset}/table_name/)
         if jurisdiction:
-            history_path = f"gcs://{self.gcs_bucket}/{self.pipeline_name}/{jurisdiction}/load_history/*.parquet"
+            history_path = f"gcs://{self.gcs_bucket}/{self.pipeline_name}/{jurisdiction}/load_history/**/*.parquet"
         else:
             history_path = self._get_history_path()
 
@@ -134,6 +140,60 @@ class LoadHistoryManager:
             True if URL is in load history
         """
         return url in self._loaded_urls
+
+    def get_loaded_partition_values(self, partition_field: str = "year") -> Set[str]:
+        """
+        Get set of partition values that have already been loaded.
+
+        Useful for skipping years during discovery to avoid unnecessary probing.
+
+        Args:
+            partition_field: Partition field to extract (default: "year")
+
+        Returns:
+            Set of partition values (e.g., {"2024", "2023", "2022"})
+        """
+        import json
+
+        # If no history loaded yet, return empty set
+        if not self._loaded_urls:
+            return set()
+
+        # Query history to get partition values
+        try:
+            conn = duckdb.connect(":memory:")
+            self._init_duckdb_gcs(conn)
+
+            # Use the same path logic as load_existing_history
+            if self._jurisdiction:
+                history_path = f"gcs://{self.gcs_bucket}/{self.pipeline_name}/{self._jurisdiction}/load_history/**/*.parquet"
+            else:
+                history_path = self._get_history_path()
+
+            query = f"""
+                SELECT DISTINCT partition_values
+                FROM read_parquet('{history_path}')
+            """
+
+            result = conn.execute(query).fetchall()
+
+            # Parse JSON partition_values and extract the requested field
+            partition_set = set()
+            for row in result:
+                partition_json = row[0]
+                try:
+                    partition_dict = json.loads(partition_json)
+                    if partition_field in partition_dict:
+                        partition_set.add(partition_dict[partition_field])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+            return partition_set
+
+        except Exception as e:
+            # If we can't load partition values, return empty set
+            print(f"  Warning: Could not load partition values from history: {e}")
+            return set()
 
     def filter_unloaded(self, urls: List[str]) -> List[str]:
         """
@@ -218,7 +278,7 @@ class LoadHistoryManager:
         Returns:
             List of history records as dicts
         """
-        history_path = self._get_history_path()
+        history_path = f"gcs://{self.gcs_bucket}/{self.pipeline_name}/{jurisdiction}/load_history/**/*.parquet"
 
         try:
             conn = duckdb.connect(":memory:")

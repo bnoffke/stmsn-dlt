@@ -148,6 +148,94 @@ class WebFileClient:
         except requests.RequestException:
             return False
 
+    def _generate_case_variations(self, filename: str) -> List[str]:
+        """
+        Generate common case variations of a filename.
+
+        Automatically tries multiple case variations to handle case-sensitive URLs.
+        The original filename is always tried first.
+
+        Args:
+            filename: Original filename from pattern (e.g., "2025taxroll.xlsx")
+
+        Returns:
+            List of filename variations in priority order:
+            1. Original (as-is)
+            2. lowercase
+            3. UPPERCASE
+            4. Title Case (first char after delimiters capitalized)
+            5. PascalCase after numbers (e.g., 2025TaxRoll.xlsx)
+
+        Example:
+            >>> client._generate_case_variations("2025taxroll.xlsx")
+            ["2025taxroll.xlsx", "2025TAXROLL.XLSX", "2025Taxroll.Xlsx", "2025TaxRoll.xlsx"]
+        """
+        if not filename:
+            return [filename]
+
+        variations = [filename]  # Always try original first
+
+        # Split into name and extension
+        if "." in filename:
+            parts = filename.rsplit(".", 1)
+            name, ext = parts[0], parts[1]
+        else:
+            name, ext = filename, ""
+
+        # Variation 1: all lowercase
+        variations.append(filename.lower())
+
+        # Variation 2: all UPPERCASE
+        variations.append(filename.upper())
+
+        # Variation 3: Capitalize first letter only
+        # 2025taxroll → 2025Taxroll
+        if name:
+            title_name = name[0].upper() + name[1:].lower()
+            title_variation = f"{title_name}.{ext}" if ext else title_name
+            variations.append(title_variation)
+
+        # Variation 4: Capitalize letter after each number
+        # 2025taxroll → 2025Taxroll
+        pascal_name = re.sub(
+            r"(\d)([a-z])",
+            lambda m: m.group(1) + m.group(2).upper(),
+            name.lower()
+        )
+        if ext:
+            variations.append(f"{pascal_name}.{ext}")
+        else:
+            variations.append(pascal_name)
+
+        # Variation 5: Multi-word PascalCase (capitalize at midpoint of alphabetic portion)
+        # 2025taxroll → 2025TaxRoll (split "taxroll" → "Tax" + "Roll")
+        if len(name) > 3:
+            # Find where letters start
+            match = re.search(r'[a-zA-Z]', name)
+            if match:
+                prefix = name[:match.start()]  # Numbers/special chars before letters
+                letters = name[match.start():]  # The letter portion
+
+                if len(letters) > 3:
+                    # Try capitalizing at midpoint of letter portion
+                    mid = len(letters) // 2
+                    multi_word = letters[:mid].capitalize() + letters[mid:].capitalize()
+                    multi_variation = f"{prefix}{multi_word}"
+                    if ext:
+                        variations.append(f"{multi_variation}.{ext}")
+                    else:
+                        variations.append(multi_variation)
+
+        # Deduplicate while preserving order
+        seen = {}
+        deduplicated = []
+        for v in variations:
+            if v not in seen:
+                seen[v] = True
+                deduplicated.append(v)
+
+        return deduplicated
+
     def _extract_partition_values(
         self, filename: str, partition_config: List[Dict]
     ) -> Dict[str, str]:
@@ -248,6 +336,7 @@ class WebFileClient:
         url_patterns: List[str],
         partition_config: List[Dict],
         start_year: Optional[int] = None,
+        skip_partition_values: Optional[Dict[str, Set[str]]] = None,
     ) -> List[DiscoveredFile]:
         """
         Discover files by probing URL patterns for different years.
@@ -257,6 +346,7 @@ class WebFileClient:
             url_patterns: URL patterns with {year} placeholder
             partition_config: Partition configuration for value extraction
             start_year: Year to start probing from (default: current year)
+            skip_partition_values: Optional dict of partition values to skip (e.g., {"year": {"2024", "2023"}})
 
         Returns:
             List of discovered files
@@ -273,25 +363,49 @@ class WebFileClient:
         max_consecutive_misses = 3  # Stop after 3 years with no files
 
         while year >= self.MIN_YEAR and consecutive_misses < max_consecutive_misses:
+            # Skip if year already loaded
+            if skip_partition_values and "year" in skip_partition_values:
+                if str(year) in skip_partition_values["year"]:
+                    print(f"  Year {year}: SKIP (already in load history)")
+                    year -= 1
+                    continue
+
             found_for_year = False
 
             for pattern in url_patterns:
-                filename = pattern.format(year=year, month="01")  # Default month
-                url = urljoin(base_url, filename)
+                formatted_filename = pattern.format(year=year, month="01")  # Default month
 
-                if url in seen_urls:
-                    continue
+                # Generate case variations to handle case-sensitive URLs
+                filename_variations = self._generate_case_variations(formatted_filename)
 
-                if self._check_url_exists(url):
-                    seen_urls.add(url)
+                # Try each variation until one succeeds
+                discovered_url = None
+                discovered_filename = None
+
+                for variant_filename in filename_variations:
+                    url = urljoin(base_url, variant_filename)
+
+                    if url in seen_urls:
+                        continue
+
+                    if self._check_url_exists(url):
+                        discovered_url = url
+                        discovered_filename = variant_filename
+                        seen_urls.add(url)
+                        break  # Found a match, stop trying variations
+
+                # If we found a file with any variation
+                if discovered_url:
+                    # Extract partition values from the DISCOVERED filename
+                    # (not the original pattern) to ensure accurate extraction
                     partition_values = self._extract_partition_values(
-                        filename, partition_config
+                        discovered_filename, partition_config
                     )
 
                     discovered.append(
                         DiscoveredFile(
-                            url=url,
-                            filename=filename,
+                            url=discovered_url,
+                            filename=discovered_filename,
                             partition_values=partition_values,
                         )
                     )
@@ -313,6 +427,7 @@ class WebFileClient:
         url_patterns: List[str],
         partition_config: List[Dict],
         start_year: Optional[int] = None,
+        skip_partition_values: Optional[Dict[str, Set[str]]] = None,
     ) -> List[DiscoveredFile]:
         """
         Discover available files using directory listing or pattern probing.
@@ -324,6 +439,7 @@ class WebFileClient:
             url_patterns: URL patterns with placeholders like {year}
             partition_config: Partition configuration for value extraction
             start_year: Year to start probing from (default: current year)
+            skip_partition_values: Optional dict of partition values to skip (e.g., {"year": {"2024", "2023"}})
 
         Returns:
             List of discovered files, sorted by partition values (newest first)
@@ -336,7 +452,7 @@ class WebFileClient:
         # Fall back to pattern probing if no files found
         if not discovered:
             discovered = self._discover_from_patterns(
-                base_url, url_patterns, partition_config, start_year
+                base_url, url_patterns, partition_config, start_year, skip_partition_values
             )
 
         # Sort by partition values (assuming year is primary partition)

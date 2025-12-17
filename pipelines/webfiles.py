@@ -250,12 +250,21 @@ def run_pipeline(
                 ]
                 print(f"Using explicit URL: {explicit_url}")
             else:
+                # Get partition values already loaded (to skip during discovery)
+                skip_partition_values = None
+                if history_manager and not force:
+                    loaded_years = history_manager.get_loaded_partition_values("year")
+                    if loaded_years:
+                        skip_partition_values = {"year": loaded_years}
+                        print(f"Will skip years already loaded: {sorted(loaded_years, reverse=True)}")
+
                 # Discover available files
                 print(f"Discovering files from {base_url}...")
                 discovered = web_client.discover_files(
                     base_url=base_url,
                     url_patterns=url_patterns,
                     partition_config=partition_config,
+                    skip_partition_values=skip_partition_values,
                 )
                 print(f"Discovered {len(discovered)} file(s)")
 
